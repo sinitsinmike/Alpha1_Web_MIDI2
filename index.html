@@ -245,7 +245,14 @@ while (true) {
     }
 
     log("Writing " + bytes.length + " bytes...");
-    await writer.write(textEncoder.encode(hex));
+
+    const CHUNK_HEX_SIZE = 128; // 128 HEX chars = 64 binary bytes per chunk
+    
+    for (let i = 0; i < hex.length; i += CHUNK_HEX_SIZE) {
+        const chunk = hex.slice(i, i + CHUNK_HEX_SIZE);
+        await writer.write(textEncoder.encode(chunk));
+        await new Promise(resolve => setTimeout(resolve, 5));
+    }
 
 let finalResponse = "";
 const startTime = Date.now();
@@ -342,14 +349,27 @@ function buildBinFromMidi(midiBytes) {
         log("Not a MIDI file");
         return null;
     }
-
-    const tracks = dv.getUint16(10,false);
-    const ppq    = dv.getUint16(12,false);   
     
-    log("PPQ: " + ppq);     
-                    
-    let offset = 14;
-    let eventsPerTrack = [];
+const format = dv.getUint16(8,false);
+const tracks = dv.getUint16(10,false);
+const ppq    = dv.getUint16(12,false);
+
+if (format === 0) {
+    log("MIDI Type 0 detected");
+} else if (format === 1) {
+    log("MIDI Type 1 detected");
+} else {
+    log("Unsupported MIDI format: " + format);
+    return null;
+}
+
+log("PPQ: " + ppq);
+
+let offset = 14;
+    
+    let eventsPerTrack = (format === 0)
+        ? new Array(16).fill(null).map(() => [])
+        : [];
     let detectedBpm = 120;   // ← по умолчанию
 
     for (let t=0; t<tracks; t++) {
@@ -359,13 +379,13 @@ function buildBinFromMidi(midiBytes) {
             return null;
         }
 
-        const length = dv.getUint32(offset+4,false);
-        offset += 8;
-        const end = offset + length;
+const length = dv.getUint32(offset+4,false);
+offset += 8;
+const end = offset + length;
 
-        let tick = 0;
-        let events = [];
-        let runningStatus = null;
+let tick = 0;
+let events = (format === 1) ? [] : null;
+let runningStatus = null;
 
         while (offset < end) {
 
@@ -439,10 +459,25 @@ const type = status & 0xF0;
 const ch   = status & 0x0F;
 
 // Note Off
+
 if (type === 0x80) {
+
     const note = midiBytes[offset++];
     const vel  = midiBytes[offset++];
-    events.push({tick: scaledTick, type: 0, note, vel: 0, ch});
+
+    const ev = {
+        tick: scaledTick,
+        type: 0,
+        note,
+        vel: 0,
+        ch
+    };
+
+    if (format === 0) {
+        eventsPerTrack[ch].push(ev);
+    } else {
+        events.push(ev);
+    }
     continue;
 }
 
@@ -451,16 +486,60 @@ if (type === 0x90) {
     const note = midiBytes[offset++];
     const vel  = midiBytes[offset++];
 
-    if (vel > 0) {
-        events.push({tick: scaledTick, type: 1, note, vel, ch});
+    const ev = (vel > 0)
+        ? {
+            tick: scaledTick,
+            type: 1,
+            note,
+            vel,
+            ch
+        }
+        : {
+            tick: scaledTick,
+            type: 0,
+            note,
+            vel: 0,
+            ch
+        };
+
+    if (format === 0) {
+        eventsPerTrack[ch].push(ev);
     } else {
-        events.push({tick: scaledTick, type: 0, note, vel: 0, ch});
+        events.push(ev);
     }
     continue;
 }
 
 // 2-data-byte channel messages: A0, B0, E0
-if (type === 0xA0 || type === 0xB0 || type === 0xE0) {
+// Control Change (B0)
+if (type === 0xB0) {
+
+    const cc  = midiBytes[offset++];
+    const val = midiBytes[offset++];
+
+    // sustain only
+    if (cc === 64) {
+
+        const ev = {
+            tick: scaledTick,
+            type: 2,
+            note: 64,
+            vel: val,
+            ch
+        };
+
+        if (format === 0) {
+            eventsPerTrack[ch].push(ev);
+        } else {
+            events.push(ev);
+        }
+    }
+
+    continue;
+}
+
+// A0 / E0 ignore
+if (type === 0xA0 || type === 0xE0) {
     offset += 2;
     continue;
 }
@@ -476,11 +555,14 @@ log("Unknown MIDI event: 0x" + status.toString(16));
 return null;
         }
 
-        eventsPerTrack.push(events);
+        if (format === 1) {
+            eventsPerTrack.push(events);
+        }
+
         offset = end;
     }
 
-    let buffer = new Uint8Array(16384);
+    let buffer = new Uint8Array(24576); // 24KB (совпадает с прошивкой)
     let view   = new DataView(buffer.buffer);
 
 view.setUint32(0,0x4D534551,true);  // magic
@@ -504,16 +586,33 @@ view.setUint8(19,0);                   // padding
     let ptr = 20;
     buffer[ptr++] = 0;
 
-    for (let t=0;t<16;t++) {
+for (let t=0; t<16; t++) {
 
-        let events = eventsPerTrack[t] || [];
+    let events;
+
+    if (format === 0) {
+        events = eventsPerTrack[t] || [];
+    } else {
+        // Type 1 → берём реальные треки, остальные пустые
+        events = (t < eventsPerTrack.length)
+            ? eventsPerTrack[t]
+            : [];
+    }
 
         if (ptr + 2 > buffer.length) {
             log("BIN buffer overflow");
             return null;
         }
 
-        view.setUint16(ptr, events.length, true);
+if (events.length > 1024) {
+    log("❌ Too many events in track");
+    log("Track events: " + events.length);
+    log("Limit: 1024");
+    log("Conversion cancelled");
+    return null;
+}
+
+view.setUint16(ptr, events.length, true);
         ptr += 2;
 
         for (let e of events) {
@@ -534,7 +633,14 @@ view.setUint8(19,0);                   // padding
     }
 
 
-    return buffer.slice(0, ptr);
+    if (ptr > buffer.length) {
+    log("❌ FINAL BUFFER OVERFLOW: " + ptr + " > " + buffer.length);
+    return null;
+}
+
+log("Built BIN size: " + ptr + " bytes");
+
+return buffer.slice(0, ptr);
 
 }
 function buildMidiFromBin(bytes) {
@@ -647,15 +753,21 @@ function buildTrackChunk(events, trackIndex) {
 
         writeVarLen(data, delta);
 
-        if (e.type == 1) {
-            data.push(0x90 | (e.ch & 0x0F));
-            data.push(e.note);
-            data.push(e.vel);
-        } else {
-            data.push(0x80 | (e.ch & 0x0F));
-            data.push(e.note);
-            data.push(0);
-        }
+if (e.type == 1) {
+    data.push(0x90 | (e.ch & 0x0F));
+    data.push(e.note);
+    data.push(e.vel);
+}
+else if (e.type == 0) {
+    data.push(0x80 | (e.ch & 0x0F));
+    data.push(e.note);
+    data.push(0);
+}
+else if (e.type == 2) {
+    data.push(0xB0 | (e.ch & 0x0F));
+    data.push(e.note); // CC number, sustain = 64
+    data.push(e.vel);  // CC value
+}
     }
 
     // End of track
@@ -832,12 +944,25 @@ document.getElementById("midiFileInput").addEventListener("change", async functi
     const arrayBuffer = await file.arrayBuffer();
     const midiBytes = new Uint8Array(arrayBuffer);
 
-    const binBytes = buildBinFromMidi(midiBytes);
+const binBytes = buildBinFromMidi(midiBytes);
 
-    if (!binBytes) {
-        log("Invalid MIDI");
-        return;
-    }
+if (!binBytes) {
+    log("Invalid MIDI");
+    return;
+}
+
+// ===== SIZE GUARD (Alpha7 critical fix) =====
+const DEVICE_LIMIT = 24576;
+
+if (binBytes.length > DEVICE_LIMIT) {
+
+    log("❌ Project too large for device");
+    log("Built BIN size: " + binBytes.length + " bytes");
+    log("Limit: " + DEVICE_LIMIT + " bytes");
+    log("Transfer cancelled");
+
+    return;
+}
 
     await uploadBinToDevice(pendingMidiProject, binBytes);
 e.target.value = "";
